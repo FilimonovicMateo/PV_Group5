@@ -2,21 +2,17 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, CubicSpline
 from scipy.optimize import minimize_scalar
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+# Settings
 DATA_FILE = 'IvanData.csv'
 BATTERY_SOC_MIN = 0.20  # 20% minimum state of charge
 BATTERY_SOC_MAX = 0.80  # 80% maximum state of charge
 BATTERY_EFFICIENCY = 1.0  # 100% efficiency (can be modified)
-RAMP_HOURS = 1  # Hours for ramp-up before sunrise and ramp-down after sunset
+RAMP_HOURS = 2  # Hours for ramp-up before sunrise and ramp-down after sunset
 
-# ==========================================
-# DATA LOADING AND PARSING
-# ==========================================
+# loading from csv
 
 def load_and_parse_data(filepath):
     """
@@ -56,9 +52,7 @@ def group_by_day(df):
     return daily_data
 
 
-# ==========================================
-# IDEAL CURVE GENERATION
-# ==========================================
+# now we make the curve
 
 def find_generation_window(daily_power):
     """
@@ -80,11 +74,11 @@ def find_generation_window(daily_power):
 
 def create_smooth_ideal_curve(daily_power, hours):
     """
-    Create a smooth ideal power curve using a modified sinusoidal shape.
+    Create a smooth ideal power curve using a sinusoidal shape.
     
     The curve:
     - Starts ramping up 1 hour before first generation
-    - Peaks around midday
+    - Peaks around midday (follows sine curve)
     - Ramps down to 0 one hour after last generation
     - Redistributes the same total daily energy smoothly
     
@@ -93,7 +87,7 @@ def create_smooth_ideal_curve(daily_power, hours):
     n_hours = len(daily_power)
     ideal_curve = np.zeros(n_hours)
     
-    # Calculate total daily energy (kWh)
+    # Calculate total daily energy (Wh, since power is in W and time step is 1 hour)
     total_energy = np.sum(daily_power)
     
     if total_energy == 0:
@@ -115,12 +109,16 @@ def create_smooth_ideal_curve(daily_power, hours):
     if window_length <= 0:
         return ideal_curve
     
-    # Create smooth curve using raised cosine (Hann-like) function
-    # This provides smooth onset and decline
+    # Create smooth curve using sine function
+    # Map from 0 to π for a complete sine hump (0 -> peak -> 0)
     t = np.linspace(0, np.pi, window_length)
     
-    # Raised cosine: smooth curve from 0 to 1 and back to 0
-    smooth_shape = (1 - np.cos(t)) / 2
+    # Pure sine curve: starts at 0, peaks at π/2, returns to 0 at π
+    smooth_shape = np.sin(t)
+    
+    # Debug: print shape characteristics
+    # print(f"Window: {start_idx} to {end_idx}, Length: {window_length}")
+    # print(f"Smooth shape - Min: {smooth_shape.min():.3f}, Max: {smooth_shape.max():.3f}, Sum: {smooth_shape.sum():.3f}")
     
     # Scale to match total energy
     # Energy = sum of power values (since time step is 1 hour)
@@ -129,6 +127,9 @@ def create_smooth_ideal_curve(daily_power, hours):
     scaling_factor = total_energy / curve_area if curve_area > 0 else 0
     
     ideal_curve[start_idx:end_idx+1] = smooth_shape * scaling_factor
+    
+    # Debug: verify energy conservation
+    # print(f"Total energy: {total_energy:.2f} Wh, Ideal energy: {np.sum(ideal_curve):.2f} Wh")
     
     return ideal_curve
 
@@ -265,7 +266,7 @@ def plot_sample_days(results, sample_dates=None, n_samples=5):
         sample_dates = sorted_dates[:n_samples]
     
     n_plots = len(sample_dates)
-    fig, axes = plt.subplots(n_plots, 1, figsize=(12, 3*n_plots))
+    fig, axes = plt.subplots(n_plots, 1, figsize=(14, 3.5*n_plots))
     
     if n_plots == 1:
         axes = [axes]
@@ -274,26 +275,71 @@ def plot_sample_days(results, sample_dates=None, n_samples=5):
         data = results[date]
         hours = np.arange(len(data['actual_power']))
         
-        axes[idx].plot(hours, data['actual_power'], 'b-', linewidth=2, 
-                      label='Actual Power', alpha=0.7)
-        axes[idx].plot(hours, data['ideal_power'], 'r--', linewidth=2, 
-                      label='Ideal Smooth Power')
-        axes[idx].fill_between(hours, data['actual_power'], alpha=0.3)
-        axes[idx].fill_between(hours, data['ideal_power'], alpha=0.2, color='red')
+        # Find generation window boundaries
+        gen_mask = data['actual_power'] > 0
+        if gen_mask.any():
+            first_gen = np.where(gen_mask)[0][0]
+            last_gen = np.where(gen_mask)[0][-1]
+        else:
+            first_gen = 0
+            last_gen = 0
         
-        axes[idx].set_xlabel('Hour of Day')
-        axes[idx].set_ylabel('Power (W)')
+        # Create high-resolution interpolation for smooth curves
+        hours_fine = np.linspace(0, len(data['actual_power'])-1, 500)
+        
+        # Cubic spline interpolation for actual power
+        cs_actual = CubicSpline(hours, data['actual_power'], bc_type='natural')
+        actual_smooth = cs_actual(hours_fine)
+        
+        # Cubic spline interpolation for ideal power
+        cs_ideal = CubicSpline(hours, data['ideal_power'], bc_type='natural')
+        ideal_smooth = cs_ideal(hours_fine)
+        
+        # Force zero outside extended window for actual power only
+        # Extended window: 1 hour before first generation and 1 hour after last generation
+        if gen_mask.any():
+            # Extended boundaries for forcing zeros (1 hour margin)
+            first_force = max(0, first_gen - 1)
+            last_force = min(len(data['actual_power']) - 1, last_gen + 1)
+            
+            # Map fine resolution indices
+            first_force_fine = int(first_force * 500 / 24)
+            last_force_fine = int((last_force + 1) * 500 / 24)
+            
+            # Only force actual power to zero (not ideal - it has its own ramp)
+            actual_smooth[:first_force_fine] = 0
+            actual_smooth[last_force_fine:] = 0
+        
+        # Ensure no negative values
+        actual_smooth = np.maximum(0, actual_smooth)
+        ideal_smooth = np.maximum(0, ideal_smooth)
+        
+        # Plot smoothed curves
+        axes[idx].plot(hours_fine, actual_smooth, 'b-', linewidth=2.5, 
+                      label='Actual Power', alpha=0.8)
+        axes[idx].plot(hours_fine, ideal_smooth, 'r--', linewidth=2.5, 
+                      label='Ideal Smooth Power (Sine)', alpha=0.8)
+        axes[idx].fill_between(hours_fine, actual_smooth, alpha=0.2, color='blue')
+        axes[idx].fill_between(hours_fine, ideal_smooth, alpha=0.15, color='red')
+        
+        axes[idx].set_xlabel('Hour of Day', fontsize=11)
+        axes[idx].set_ylabel('Power (W)', fontsize=11)
         axes[idx].set_title(f'Date: {date} | Total Energy: {data["total_energy"]:.2f} Wh | '
-                          f'Required Battery: {data["required_capacity"]:.2f} kWh')
-        axes[idx].legend()
-        axes[idx].grid(True, alpha=0.3)
+                          f'Battery Required: {data["required_capacity"]:.2f} kWh', fontsize=12)
+        axes[idx].legend(loc='upper right')
+        axes[idx].grid(True, alpha=0.3, linestyle='--')
         axes[idx].set_xlim(0, 23)
+        
+        # Add vertical lines at generation window for clarity
+        gen_hours = np.where(data['actual_power'] > 0)[0]
+        if len(gen_hours) > 0:
+            axes[idx].axvline(x=gen_hours[0], color='gray', linestyle=':', alpha=0.5, linewidth=1)
+            axes[idx].axvline(x=gen_hours[-1], color='gray', linestyle=':', alpha=0.5, linewidth=1)
     
     plt.tight_layout()
     plt.savefig('daily_power_curves.png', dpi=300, bbox_inches='tight')
     print("\nSaved: daily_power_curves.png")
     plt.show()
-
 
 def plot_battery_soc(results, sample_dates=None, n_samples=5):
     """
@@ -326,7 +372,16 @@ def plot_battery_soc(results, sample_dates=None, n_samples=5):
         else:
             soc_percent = np.zeros_like(data['soc_profile'])
         
-        axes[idx].plot(hours, soc_percent, 'g-', linewidth=2)
+        # Create high-resolution interpolation for smooth SOC curve
+        hours_fine = np.linspace(0, len(soc_percent)-1, 500)
+        
+        # Use monotonic cubic spline to avoid oscillations
+        from scipy.interpolate import PchipInterpolator
+        cs_soc = PchipInterpolator(hours, soc_percent)
+        soc_smooth = cs_soc(hours_fine)
+        soc_smooth = np.clip(soc_smooth, 0, 100)  # Ensure within 0-100%
+        
+        axes[idx].plot(hours_fine, soc_smooth, 'g-', linewidth=2.5, alpha=0.9)
         axes[idx].axhline(y=BATTERY_SOC_MIN*100, color='r', linestyle='--', 
                          label=f'Min SOC ({BATTERY_SOC_MIN*100}%)')
         axes[idx].axhline(y=BATTERY_SOC_MAX*100, color='r', linestyle='--', 
@@ -424,12 +479,15 @@ def main():
     
     # Visualizations
     print("\nGenerating visualizations...")
+
+    # Specify sample dates (convert strings to date objects)
+    sample_dates = [datetime.strptime(d, '%Y%m%d').date() for d in ['20230101', '20230601', '20231201']]
     
     # Plot sample days with highest energy production
-    plot_sample_days(results, n_samples=5)
+    plot_sample_days(results, sample_dates, n_samples=3)
     
     # Plot battery SOC for days with highest capacity requirements
-    plot_battery_soc(results, n_samples=5)
+    plot_battery_soc(results, sample_dates, n_samples=3)
     
     # Plot capacity distribution
     plot_capacity_distribution(results)
